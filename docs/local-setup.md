@@ -16,7 +16,7 @@ How to install the server on your machine, log in so it can reach Google Cloud, 
 
 | Tool | Version | Check |
 |---|---|---|
-| Node.js | 20 or newer (tested on 22 and 24) | `node -v` |
+| Node.js | 22.13 or newer (tested on 22 and 24; the history database uses the built-in `node:sqlite`) | `node -v` |
 | npm | comes with Node | `npm -v` |
 | Google Cloud CLI | any recent | `gcloud --version` |
 | Claude Desktop and/or Claude Code | latest | see [Claude setup](claude-setup.md) |
@@ -35,13 +35,13 @@ which node        # note this absolute path: Claude Desktop needs it
 ## 1. Get the code and install
 
 ```bash
-git clone https://github.com/<owner>/gcp-monitor-mcp.git
+git clone https://github.com/drashta13/gcp-monitor-mcp.git
 cd gcp-monitor-mcp
-npm install
+npm ci          # installs exactly what package-lock.json pins
 npm test          # runs offline against fakes, no Google Cloud access needed
 ```
 
-Run `npm install` again whenever `package.json` changes (after a pull).
+Run `npm ci` again whenever `package-lock.json` changes (after a pull).
 
 ## 2. Log in to Google Cloud
 
@@ -93,6 +93,9 @@ The server reads environment variables. You set them in the Claude config ([Clau
 | `GCP_BILLING_EXPORT_TABLE` | instead of App Optimize | `billing-proj.billing.gcp_billing_export_resource_v1_0123AB` | BigQuery billing export table. Wins over App Optimize when set |
 | `GCP_BILLING_QUERY_PROJECT` | no | `billing-proj` | Project that runs and pays for BigQuery jobs. Default: the table's project |
 | `GCP_BQ_MAX_BYTES_BILLED` | no | `5368709120` | Per-query scan cap in bytes. Default 5 GiB |
+| `GCP_MONITOR_DB_PATH` | no | `/Users/you/.gcp-monitor-mcp/history.db` | History database file, absolute path. Default `~/.gcp-monitor-mcp/history.db`. Created with mode 0600 in a 0700 folder |
+| `GCP_MONITOR_HISTORY_DAYS` | no | `400` | Days of snapshots, reports and metrics to keep (minimum 7) |
+| `GCP_MONITOR_HISTORY` | no | `off` | Turns the history database and its 8 tools off |
 
 There are no secrets in this list. Credentials come from ADC, never from environment variables.
 
@@ -130,11 +133,27 @@ The Inspector's default request timeout is 10 seconds, but cost reports take 15 
 
 Then connect it to Claude: [Claude setup](claude-setup.md).
 
+## Capture from the terminal
+
+`capture_snapshot` also runs without Claude, with the same environment variables as the server. Use it to backfill history, or from cron / launchd. Progress goes to stderr, one JSON line per day to stdout.
+
+```bash
+export GCP_COST_REPORT_PROJECT=my-main-project GCP_MONITOR_ALLOWED_PROJECTS=proj-a,proj-b,proj-c
+npm run capture                                         # the default day: 2 days ago, cost source time zone
+npm run capture -- --day 2026-10-01
+npm run capture -- --from 2026-09-17 --to 2026-10-13 --skip-existing
+npm run capture -- --missing                            # every day of the last 28 without a snapshot
+npm run capture -- --day 2026-10-13 --sections incidents,vm   # re-run some sections, keep the rest of the day
+npm run capture -- --recompute-anomalies                # no API calls: redo every stored day's anomaly findings
+```
+
+Backfill oldest first, so each day's anomalies are worked out against the days before it. A day takes 2 to 6 minutes. How far back you can go (measured October 2026): App Optimize cost about a year, Cloud Monitoring metrics at least 6 weeks, Cloud Logging logs usually 30 days (admin-audit logs 400). Older days still capture what exists, and log-based sections are marked `partial`. Configuration such as backups, versions and the inventory is always as of the capture, even for past days.
+
 ## Updating
 
 ```bash
 git pull
-npm install
+npm ci
 npm test
 ```
 
@@ -144,7 +163,7 @@ Then restart the client: fully quit and reopen Claude Desktop, or run `/mcp` →
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Cannot find module '@google-cloud/...'` / `ERR_MODULE_NOT_FOUND` | Dependencies not installed after a pull | `npm install`, restart Claude |
+| `Cannot find module '@google-cloud/...'` / `ERR_MODULE_NOT_FOUND` | Dependencies not installed after a pull | `npm ci`, restart Claude |
 | "Google Cloud credentials are missing or expired" | No ADC, or the login expired | Rerun `gcloud auth application-default login --impersonate-service-account=...` |
 | `Permission 'iam.serviceAccounts.getAccessToken' denied` | You lack Token Creator on the SA | [GCP setup step 3](gcp-setup.md#3-let-people-impersonate-it) |
 | "Permission denied" naming a role | The SA lacks a role in that project | Grant it ([step 4](gcp-setup.md#4-grant-roles-in-each-project)) |

@@ -1,5 +1,9 @@
 import { BigQuery } from '@google-cloud/bigquery';
 import { isDetailedExport } from '../config.js';
+import { ConfigError } from './errors.js';
+import { checkProjectIds, round, fromMap } from './util.js';
+
+export { ConfigError };
 
 // Whitelisted SQL for each dimension. User input never reaches the query text,
 // only these fixed expressions and bound parameters.
@@ -26,7 +30,7 @@ const WHERE = `
 
 const BASE_TYPES = { projectIds: ['STRING'], service: 'STRING' };
 
-const round = (n) => Math.round(n * 100) / 100;
+const TZ = 'UTC';
 
 export function createBillingService(config, bigquery) {
   const { billingTable, billingQueryProject, maxBytesBilled, allowedProjects } = config;
@@ -50,12 +54,10 @@ export function createBillingService(config, bigquery) {
     return rows;
   }
 
-  // Requested projects narrowed to the allowlist. Empty result means "all allowed".
-  function scopeProjects(projectIds = []) {
-    if (!allowedProjects.length) return projectIds;
-    const denied = projectIds.filter((p) => !allowedProjects.includes(p));
-    if (denied.length) throw new ConfigError(`Projects not in GCP_MONITOR_ALLOWED_PROJECTS: ${denied.join(', ')}`);
-    return projectIds.length ? projectIds : allowedProjects;
+  // Requested projects narrowed to the allowlist. Empty result means "every project in the table".
+  function scopeProjects(projectIds) {
+    const ids = checkProjectIds(projectIds, allowedProjects);
+    return ids.length ? ids : allowedProjects;
   }
 
   function baseParams({ startDate, endDate, projectIds, service }) {
@@ -63,6 +65,8 @@ export function createBillingService(config, bigquery) {
   }
 
   return {
+    timezone: TZ,
+
     async summary({ groupBy, limit, ...filters }) {
       const rows = await run(
         `SELECT
@@ -163,16 +167,14 @@ export function createBillingService(config, bigquery) {
   };
 }
 
-export class ConfigError extends Error {}
-
-const period = ({ startDate, endDate }) => ({ startDate, endDate, timezone: 'UTC' });
+const period = ({ startDate, endDate }) => ({ startDate, endDate, timezone: TZ });
 
 const ts = (v) => v?.value ?? v ?? null;
 
 function totalsByCurrency(rows) {
-  const totals = {};
+  const totals = new Map();
   for (const r of rows) {
-    totals[r.currency] ??= { netCost: round(r.total_net_cost), groups: r.total_groups };
+    if (!totals.has(r.currency)) totals.set(r.currency, { netCost: round(r.total_net_cost), groups: r.total_groups });
   }
-  return totals;
+  return fromMap(totals);
 }

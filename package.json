@@ -1,6 +1,6 @@
 {
   "name": "gcp-monitor-mcp",
-  "version": "0.5.1",
+  "version": "0.7.0",
   "description": "MCP server for monitoring Google Cloud usage, cost and health",
   "type": "module",
   "bin": {
@@ -9,11 +9,14 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
+    "capture": "node src/capture-cli.js",
+    "report-pdf": "node scripts/report-pdf.mjs",
     "test": "node --test",
-    "inspect": "npx @modelcontextprotocol/inspector node src/index.js"
+    "inspect": "npx @modelcontextprotocol/inspector node src/index.js",
+    "coverage": "node --test --experimental-test-coverage"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "license": "UNLICENSED",
   "private": true,

@@ -408,3 +408,118 @@ test('vm describe: VM Manager off in the project is not a per-VM agent issue', (
   assert.deepEqual(row.issues, []);
   assert.equal(row.agents.osConfig, 'VM Manager off in project');
 });
+
+// ---- added with the 2026-10-14 review fixes ----
+
+// fakeRest above never truncates; this one reports truncation when the body carries a nextPageToken.
+function pagingRest(routes) {
+  const rest = fakeRest(routes);
+  rest.list = async (url, { params = {}, key, max = 1000 } = {}) => {
+    const data = await routes(url, params ?? {});
+    if (data instanceof Error) throw data;
+    rest.calls.push({ url, params });
+    return { items: (data?.[key] ?? []).slice(0, max), truncated: Boolean(data?.nextPageToken) };
+  };
+  return rest;
+}
+
+test('gke health: a cluster or reason named __proto__ in a log entry cannot touch Object.prototype', async () => {
+  const rest = fakeRest((url, params) => {
+    if (url.includes('/clusters')) return { clusters: [{ name: 'c', status: 'RUNNING', releaseChannel: { channel: 'STABLE' } }] };
+    if (params.filter?.includes('logs/events'))
+      return {
+        entries: [
+          { resource: { labels: { cluster_name: '__proto__' } }, jsonPayload: { reason: 'OOMKilling' } },
+          { resource: { labels: { cluster_name: 'constructor' } }, jsonPayload: { reason: 'keys' } },
+          { resource: { labels: { cluster_name: 'c' } }, jsonPayload: { reason: '__proto__' } },
+        ],
+      };
+    return { entries: [] };
+  });
+  const out = await createGkeHealthService({ scope, rest, usage: fakeUsage({}), now: () => NOW }).health({});
+  assert.equal(Object.prototype.OOMKilling, undefined);
+  assert.equal(typeof Object.keys, 'function');
+  assert.deepEqual(out.clusters[0].issues, []); // the "c" cluster has no OOM kills
+  assert.equal(Object.hasOwn(out.clusters[0].events, '__proto__'), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(out.clusters[0].events)), { ['__proto__']: 1 });
+});
+
+test('query_logs: structured payloads, broken log names and quotes in resourceName do not break the call', async () => {
+  const rest = fakeRest(() => ({
+    entries: [
+      {
+        timestamp: '2026-10-14T11:00:00Z',
+        severity: 'ERROR',
+        logName: 'projects/p/logs/app%E0',
+        resource: { type: 'global', labels: {} },
+        jsonPayload: { message: { code: 500, detail: 'boom' }, reason: { nested: true } },
+      },
+      {
+        timestamp: '2026-10-14T10:00:00Z',
+        logName: 'projects/p/logs/app',
+        resource: { type: 'global', labels: {} },
+        jsonPayload: { error: { stack: 'x' } },
+      },
+    ],
+  }));
+  const out = await createLogsService({ scope, rest, now: () => NOW }).query({
+    resourceName: 'web" OR severity>=DEBUG OR "\\',
+    hours: 1,
+    limit: 10,
+  });
+  assert.match(out.filter, / AND "web OR severity>=DEBUG OR "$/);
+  assert.equal(out.entries[0].log, 'app%E0');
+  assert.equal(out.entries[0].message, '{"nested":true}: {"code":500,"detail":"boom"}');
+  assert.equal(out.entries[0].reason, '{"nested":true}');
+  assert.equal(out.entries[1].message, '{"stack":"x"}');
+  assert.equal(out.truncated, false);
+});
+
+test('query_logs: truncated only when entries were actually left out', async () => {
+  const entry = (h) => ({ timestamp: `2026-10-14T${h}:00:00Z`, logName: 'projects/p/logs/a', resource: { type: 't' } });
+  const two = fakeRest(() => ({ entries: [entry('11'), entry('10')] }));
+  assert.equal((await createLogsService({ scope, rest: two, now: () => NOW }).query({ limit: 2 })).truncated, false);
+  // Two projects each filling the limit: more entries exist than were returned.
+  const wide = createProjectScope({ allowedProjects: ['p', 'q'] }, { list: async () => [] });
+  assert.equal((await createLogsService({ scope: wide, rest: two, now: () => NOW }).query({ limit: 2 })).truncated, true);
+  const paged = pagingRest(() => ({ entries: [entry('11')], nextPageToken: 'more' }));
+  assert.equal((await createLogsService({ scope, rest: paged, now: () => NOW }).query({ limit: 5 })).truncated, true);
+});
+
+test('vm health leaves GKE node VMs out unless asked, and honours limit', async () => {
+  const vm = (name, labels) => ({ id: name, name, zone: 'z/z1', status: 'RUNNING', machineType: 'm/e2', labels });
+  const rest = fakeRest((url) => {
+    if (url.endsWith('/aggregated/instances'))
+      return { items: { 'zones/z1': { instances: [vm('app-1'), vm('gke-pool-abc', { 'goog-gke-node': '' }), vm('app-2')] } } };
+    if (url.endsWith('/aggregated/disks')) return { items: {} };
+    if (url.endsWith('/global/snapshots')) return { items: [] };
+    if (url.endsWith('/aggregated/resourcePolicies')) return { items: {} };
+    return {};
+  });
+  const svc = createVmHealthService({ scope, rest, usage: fakeUsage({}), now: () => NOW });
+  const out = await svc.health({ limit: 1 });
+  assert.equal(out.summary.vms, 2);
+  assert.equal(out.summary.gkeNodesSkipped, 1);
+  assert.deepEqual({ returned: out.returned, truncated: out.truncated, names: out.vms.map((v) => v.name) }, {
+    returned: 1,
+    truncated: true,
+    names: ['app-1'],
+  });
+  const all = await svc.health({ includeGkeNodes: true });
+  assert.equal(all.summary.vms, 3);
+  assert.equal(all.vms.find((v) => v.name === 'gke-pool-abc').gkeNode, true);
+});
+
+test('incidents asks the API for open-or-recent alerts and says when the list was cut off', async () => {
+  const rest = pagingRest((url) => {
+    if (url.endsWith('/alerts'))
+      return { alerts: [{ state: 'OPEN', openTime: '2026-10-14T11:00:00Z', policy: { displayName: '__proto__' } }], nextPageToken: 'x' };
+    return new Error('403 SERVICE_DISABLED');
+  });
+  const out = await createIncidentsService({ scope, rest, usage: fakeUsage({}), now: () => NOW }).incidents({ hours: 24 });
+  const call = rest.calls.find((c) => c.url.endsWith('/alerts'));
+  assert.equal(call.params.filter, 'state="OPEN" OR open_time>="2026-10-13T12:00:00Z"');
+  assert.deepEqual(out.alertsTruncatedIn, ['p']);
+  assert.deepEqual(out.byPolicy, [{ policy: '__proto__', severity: null, count: 1, open: 1, totalMinutes: 60 }]);
+  assert.equal(Object.prototype.count, undefined);
+});

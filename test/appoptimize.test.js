@@ -232,3 +232,65 @@ test('date helpers', () => {
   assert.equal(bucket('2026-10-11', 'week'), '2026-10-05');
   assert.equal(bucket('2026-10-11', 'month'), '2026-10');
 });
+
+// ---- added with the 2026-10-14 review fixes ----
+
+test('service filter escapes backslashes and quotes, and refuses control characters', async () => {
+  const { quote } = await import('../src/gcp/appoptimize.js');
+  assert.equal(quote("x\\' || true || '"), "'x\\\\\\' || true || \\''");
+  assert.equal(quote('Cloud SQL'), "'Cloud SQL'");
+  assert.throws(() => quote('a\nb'), /control characters/);
+  const client = fakeClient([{ name: 'day', type: 'STRING' }, COST], [[]]);
+  const mcp = await connect(client);
+  await mcp.callTool({ name: 'get_cost_trend', arguments: { service: "x\\' || true || '" } });
+  assert.ok(client.calls.create[0].report.filter.endsWith("product_display_name == 'x\\\\\\' || true || \\''"));
+});
+
+test('pacificMidnight uses the offset in force at that midnight, including DST switch days', () => {
+  assert.equal(pacificMidnight('2026-03-08'), '2026-03-08T00:00:00-08:00'); // clocks go forward at 02:00
+  assert.equal(pacificMidnight('2026-03-09'), '2026-03-09T00:00:00-07:00');
+  assert.equal(pacificMidnight('2026-11-01'), '2026-11-01T00:00:00-07:00'); // clocks go back at 02:00
+  assert.equal(pacificMidnight('2026-11-02'), '2026-11-02T00:00:00-08:00');
+});
+
+test('toObject normalises day to YYYY-MM-DD and keeps a zero cost as a number', () => {
+  const columns = [{ name: 'day' }, COST];
+  const row = (day) => ({ values: [day, cost(0)] });
+  assert.equal(toObject(row(str('2026-10-01T07:00:00Z')), columns).day, '2026-10-01');
+  assert.equal(toObject(row({ structValue: { fields: { seconds: str(String(Date.parse('2026-10-01T07:00:00Z') / 1000)) } } }), columns).day, '2026-10-01');
+  assert.deepEqual(toObject(row(str('2026-10-01')), columns).cost, { amount: 0, currency: 'INR' });
+  assert.deepEqual(toObject({ values: [str('2026-10-01'), { numberValue: 0 }] }, columns).cost, { amount: 0, currency: null });
+});
+
+test('trend survives timestamp-shaped days', async () => {
+  const columns = [{ name: 'day', type: 'STRING' }, COST];
+  const client = fakeClient(columns, [[{ values: [str('2026-10-05T07:00:00Z'), cost(10)] }]]);
+  const mcp = await connect(client);
+  const out = parse(await mcp.callTool({ name: 'get_cost_trend', arguments: { granularity: 'week' } }));
+  assert.deepEqual(out.points, [{ period: '2026-10-05', cost: 10, currency: 'INR' }]);
+});
+
+test('a report is deleted even when building or reading it fails', async () => {
+  const client = fakeClient([{ name: 'day', type: 'STRING' }, COST], [[]]);
+  client.createReport = async (req) => (client.calls.create.push(req), [{ promise: async () => { throw new Error('7 PERMISSION_DENIED'); } }]);
+  const mcp = await connect(client);
+  const res = await mcp.callTool({ name: 'get_cost_trend', arguments: {} });
+  assert.ok(res.isError);
+  await new Promise((r) => setImmediate(r));
+  assert.equal(client.calls.del.length, 1);
+  assert.equal(client.calls.del[0].name, `projects/fs-life-prod/locations/global/reports/${client.calls.create[0].reportId}`);
+});
+
+test('comparison refuses to add up costs in different currencies', async () => {
+  const columns = [{ name: 'product_display_name' }, { name: 'day' }, COST];
+  const client = fakeClient(columns, [
+    [
+      { values: [str('A'), str('2026-10-01'), cost(1, 0, 'INR')] },
+      { values: [str('B'), str('2026-10-01'), cost(1, 0, 'USD')] },
+    ],
+  ]);
+  const mcp = await connect(client);
+  const res = await mcp.callTool({ name: 'get_cost_comparison', arguments: {} });
+  assert.ok(res.isError);
+  assert.match(res.content[0].text, /more than one currency \(INR, USD\)/);
+});

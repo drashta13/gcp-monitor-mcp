@@ -1,4 +1,11 @@
 node_modules/
+coverage/
 .env
+.env.*
 *.log
 .DS_Store
+.idea/
+.vscode/
+
+# Daily reports written by the scheduled report task (sensitive: costs, resource names)
+reports/

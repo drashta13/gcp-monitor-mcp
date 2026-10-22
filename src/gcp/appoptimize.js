@@ -1,11 +1,12 @@
 import { AppOptimizeClient } from '@google-cloud/appoptimize';
-import { ConfigError } from './billing.js';
-import { mapLimit } from './util.js';
-import { compareCosts, comparisonWindows, addDays as shiftDays } from './comparison.js';
+import { ConfigError } from './errors.js';
+import { checkProjectIds, mapLimit, round, fromMap, dateIn } from './util.js';
+import { compareCosts, comparisonWindows, addDays } from './comparison.js';
 
 // Cost source behind the Cloud Monitoring "Cost Explorer" page: the App Optimize API (v1beta, Preview).
 // No billing export or billing-account access needed, but costs are list/contract prices before
-// credits and committed-use discounts, and only the last ~30 days are available.
+// credits and committed-use discounts. History reaches back about a year (measured October 2026: data to
+// ~12 months ago); a day older than that comes back empty, not as an error.
 
 // The API only accepts certain dimension combinations (plus any of day/month/hour), so each groupBy maps to
 // an allowed set and a key built from it. product_display_name is in every set so the service filter
@@ -26,34 +27,38 @@ const MAX_ROWS = 50_000; // per project
 const CONCURRENCY = 4;
 const PAGE_SIZE = 1000;
 const TZ = 'America/Los_Angeles'; // App Optimize buckets days in Pacific Time
-const LOOKBACK_DAYS = 30;
+const LOOKBACK_DAYS = 365; // how far back the comparison may reach before App Optimize returns empty days
+// A report this server created but never deleted (crash, client killed mid-call) is readable by anyone
+// with appoptimize.reports.getData on the home project; sweep such leftovers on the first call.
+const STALE_REPORT_MS = 60 * 60_000;
+const REPORT_ID_RE = /\/reports\/mcp-([a-z0-9]+)-[a-z0-9]+$/;
 
 export const APP_OPTIMIZE_NOTE =
   'Data comes from the App Optimize API (the source of Cloud Monitoring Cost Explorer). Costs are at list or ' +
-  'contract prices BEFORE credits and committed-use discounts, cover at most the last 30 days, lag usage by up to ' +
+  'contract prices BEFORE credits and committed-use discounts, reach back about a year, lag usage by up to ' +
   'a day, and days are in Pacific Time.';
 
 export function createAppOptimizeService(config, injected) {
   const { reportProject, allowedProjects } = config;
+  const parent = `projects/${reportProject}/locations/global`;
   let client = injected;
   // Reports only include `day` when a tool needs a time series: every extra dimension multiplies the rows
   // to page through (11 days = 11x the rows). If the API ever refuses to filter on an unselected `day`,
   // we fall back to always selecting it.
   let alwaysSelectDay = false;
+  let swept = false;
 
   // Project IDs a call covers: the requested ones (checked against the allowlist), else the allowlist,
   // else just the report project.
-  function projectList(projectIds = []) {
-    if (allowedProjects.length) {
-      const denied = projectIds.filter((p) => !allowedProjects.includes(p));
-      if (denied.length) throw new ConfigError(`Projects not in GCP_MONITOR_ALLOWED_PROJECTS: ${denied.join(', ')}`);
-    }
-    return projectIds.length ? projectIds : allowedProjects.length ? allowedProjects : [reportProject];
+  function projectList(projectIds) {
+    const ids = checkProjectIds(projectIds, allowedProjects);
+    return ids.length ? ids : allowedProjects.length ? allowedProjects : [reportProject];
   }
 
   // A report accepts only one scope, so run one report per project and merge the rows. A project that
   // fails (e.g. missing billing.resourceCosts.get) is reported in `failed` instead of sinking the call,
-  // unless every project fails.
+  // unless every project fails. (Not perProject(): "API disabled" here means the home project's App
+  // Optimize API is off, which is a failure, not a project that doesn't use the service.)
   async function run({ projectIds, ...args }) {
     if (!reportProject) {
       throw new ConfigError(
@@ -65,15 +70,34 @@ export function createAppOptimizeService(config, injected) {
     try {
       client ??= new AppOptimizeClient();
       await client.initialize?.(); // fail once on bad credentials instead of in every parallel report
+      if (!swept) {
+        swept = true;
+        await sweepStaleReports().catch((err) => log(`could not sweep stale reports: ${err.message}`));
+      }
       const results = await mapLimit(ids, CONCURRENCY, (id) => runReport(id, args));
       const failed = [];
       const rows = [];
+      const truncatedIn = [];
       results.forEach((r, i) => {
-        if (r.status === 'fulfilled') rows.push(...r.value);
-        else failed.push({ projectId: ids[i], error: r.reason?.message ?? String(r.reason) });
+        if (r.status !== 'fulfilled') return failed.push({ projectId: ids[i], error: r.reason?.message ?? String(r.reason) });
+        rows.push(...r.value.rows);
+        if (r.value.truncated) truncatedIn.push(ids[i]);
       });
       if (failed.length === ids.length) throw results[0].reason;
-      return { rows, failed };
+      return {
+        rows,
+        notes: {
+          ...(failed.length ? { failedProjects: failed } : {}),
+          ...(truncatedIn.length
+            ? {
+                rowsTruncatedIn: truncatedIn,
+                truncatedNote:
+                  `Reports were cut off at ${MAX_ROWS} rows per project, so totals for these projects are lower ` +
+                  'bounds. Narrow the dates or use a coarser groupBy.',
+              }
+            : {}),
+        },
+      };
     } catch (err) {
       if (!injected) client = undefined; // rebuild after auth errors, so fixing credentials needs no restart
       throw err;
@@ -97,64 +121,87 @@ export function createAppOptimizeService(config, injected) {
   }
 
   async function createAndRead(projectId, { dimensions, startDate, endDate, service }) {
-    const parent = `projects/${reportProject}/locations/global`;
     const filter = [
       `day >= timestamp('${pacificMidnight(startDate)}')`,
       `day < timestamp('${pacificMidnight(addDays(endDate, 1))}')`,
-      service ? `product_display_name == '${service.replaceAll("'", "\\'")}'` : null,
+      service ? `product_display_name == ${quote(service)}` : null,
     ]
       .filter(Boolean)
       .join(' && ');
 
-    const [operation] = await client.createReport({
-      parent,
-      reportId: `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      report: {
-        dimensions: alwaysSelectDay ? [...new Set([...dimensions, 'day'])] : dimensions,
-        metrics: ['cost'],
-        scopes: [{ project: `projects/${projectId}` }],
-        filter,
-      },
-    });
-    const [report] = await operation.promise();
-
+    // The id carries its creation time (base36 ms) so a stale report can be recognised and swept later.
+    const reportId = `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    let name = `${parent}/reports/${reportId}`;
     try {
+      const [operation] = await client.createReport({
+        parent,
+        reportId,
+        report: {
+          dimensions: alwaysSelectDay ? [...new Set([...dimensions, 'day'])] : dimensions,
+          metrics: ['cost'],
+          scopes: [{ project: `projects/${projectId}` }],
+          filter,
+        },
+      });
+      const [report] = await operation.promise();
+      name = report?.name ?? name;
+
       const rows = [];
       let pageToken;
+      let truncated = false;
       do {
-        const [, , response] = await client.readReport(
-          { name: report.name, pageSize: PAGE_SIZE, pageToken },
-          { autoPaginate: false },
-        );
+        const [, , response] = await client.readReport({ name, pageSize: PAGE_SIZE, pageToken }, { autoPaginate: false });
         rows.push(...(response.rows ?? []).map((r) => toObject(r, response.columns)));
         pageToken = response.nextPageToken || undefined;
-      } while (pageToken && rows.length < MAX_ROWS);
+        if (pageToken && rows.length >= MAX_ROWS) {
+          truncated = true;
+          break;
+        }
+      } while (pageToken);
       for (const r of rows) r.project ??= `projects/${projectId}`;
-      return rows;
+      return { rows, truncated };
     } finally {
-      client.deleteReport({ name: report.name, allowMissing: true }).catch(() => {});
+      // Whatever happened (creation failed, polling threw, read failed), make sure the report is gone.
+      deleteReport(name);
     }
   }
 
-  const base = (filters, failed) => ({
+  // Not awaited: the result shouldn't wait on cleanup. Failures are logged, and the sweep catches leftovers.
+  function deleteReport(name) {
+    Promise.resolve()
+      .then(() => client.deleteReport({ name, allowMissing: true }))
+      .catch((err) => log(`could not delete report ${name}: ${err?.message ?? err}`));
+  }
+
+  async function sweepStaleReports() {
+    if (typeof client.listReportsAsync !== 'function') return;
+    const cutoff = Date.now() - STALE_REPORT_MS;
+    for await (const r of client.listReportsAsync({ parent })) {
+      const m = REPORT_ID_RE.exec(r.name ?? '');
+      if (m && parseInt(m[1], 36) < cutoff) deleteReport(r.name);
+    }
+  }
+
+  const base = (filters, notes) => ({
     startDate: filters.startDate,
     endDate: filters.endDate,
     timezone: TZ,
     source: 'app-optimize',
     pricing: 'list/contract prices before credits and committed-use discounts',
-    ...(failed.length ? { failedProjects: failed } : {}),
+    ...notes,
   });
 
   return {
     note: APP_OPTIMIZE_NOTE,
+    timezone: TZ,
 
     async summary({ groupBy, limit, ...filters }) {
       const { dims, key } = SUMMARY[groupBy];
-      const { rows, failed } = await run({ ...filters, dimensions: dims });
+      const { rows, notes } = await run({ ...filters, dimensions: dims });
       const groups = sumBy(rows, (r) => [key(r) ?? '(none)', r.cost.currency]);
       groups.sort((a, b) => b.amount - a.amount);
       return {
-        ...base(filters, failed),
+        ...base(filters, notes),
         groupBy,
         totals: totals(groups),
         rows: groups.slice(0, limit).map((g) => ({ [groupBy]: g.key[0], cost: round(g.amount), currency: g.key[1] })),
@@ -162,11 +209,11 @@ export function createAppOptimizeService(config, injected) {
     },
 
     async trend({ granularity, ...filters }) {
-      const { rows, failed } = await run({ ...filters, dimensions: TREND_DIMS });
+      const { rows, notes } = await run({ ...filters, dimensions: TREND_DIMS });
       const points = sumBy(rows, (r) => [bucket(r.day, granularity), r.cost.currency]);
       points.sort((a, b) => a.key[0].localeCompare(b.key[0]));
       return {
-        ...base(filters, failed),
+        ...base(filters, notes),
         granularity,
         service: filters.service ?? 'all',
         points: points.map((p) => ({ period: p.key[0], cost: round(p.amount), currency: p.key[1] })),
@@ -179,9 +226,9 @@ export function createAppOptimizeService(config, injected) {
     async comparison({ days, baselineDays, endDate, threshold, limit, projectIds, service }, now = new Date()) {
       const today = pacificDate(now);
       // Default to the last complete day: today is partial, and yesterday can still be filling in.
-      const end = endDate ?? shiftDays(today, -2);
+      const end = endDate ?? addDays(today, -2);
       const windows = comparisonWindows(end, days, baselineDays);
-      const earliest = shiftDays(today, -LOOKBACK_DAYS);
+      const earliest = addDays(today, -LOOKBACK_DAYS);
       if (windows.baseline.startDate < earliest) {
         throw new ConfigError(
           `The baseline would start on ${windows.baseline.startDate}, but App Optimize only has data from ${earliest} ` +
@@ -197,6 +244,16 @@ export function createAppOptimizeService(config, injected) {
         run({ ...filters, ...windows.baseline, dimensions: RESOURCE_DIMS }),
       ]);
 
+      // Costs in different currencies can't be added together.
+      const allRows = [...daily.rows, ...currentRes.rows, ...baselineRes.rows];
+      const currencies = [...new Set(allRows.map((r) => r.cost?.currency).filter(Boolean))];
+      if (currencies.length > 1) {
+        throw new ConfigError(
+          `Costs come in more than one currency (${currencies.join(', ')}), so the comparison would add them ` +
+            'together. Narrow projectIds to projects billed in one currency.',
+        );
+      }
+
       const resources = (rows) =>
         rows
           .filter((r) => r.resource)
@@ -207,9 +264,7 @@ export function createAppOptimizeService(config, injected) {
             resourceType: r.resource_type,
             cost: r.cost.amount,
           }));
-      const failed = [...daily.failed, ...currentRes.failed, ...baselineRes.failed].filter(
-        (f, i, all) => all.findIndex((x) => x.projectId === f.projectId) === i,
-      );
+      const notes = mergeNotes([daily.notes, currentRes.notes, baselineRes.notes]);
 
       return {
         source: 'app-optimize',
@@ -220,28 +275,28 @@ export function createAppOptimizeService(config, injected) {
           windows,
           serviceDays: daily.rows.map((r) => ({
             service: r.product_display_name ?? '(none)',
-            day: String(r.day).slice(0, 10),
+            day: r.day,
             cost: r.cost.amount,
           })),
           currentResources: resources(currentRes.rows),
           baselineResources: resources(baselineRes.rows),
           threshold,
           limit,
-          currency: daily.rows[0]?.cost.currency ?? currentRes.rows[0]?.cost.currency ?? null,
+          currency: currencies[0] ?? null,
         }),
-        ...(failed.length ? { failedProjects: failed } : {}),
+        ...notes,
       };
     },
 
     async topResources({ limit, ...filters }) {
-      const { rows, failed } = await run({ ...filters, dimensions: RESOURCE_DIMS });
+      const { rows, notes } = await run({ ...filters, dimensions: RESOURCE_DIMS });
       const groups = sumBy(
         rows.filter((r) => r.resource),
         (r) => [r.resource, r.product_display_name, r.project, r.resource_type, r.cost.currency],
       );
       groups.sort((a, b) => b.amount - a.amount);
       return {
-        ...base(filters, failed),
+        ...base(filters, notes),
         rows: groups.slice(0, limit).map((g) => ({
           resource: g.key[0],
           service: g.key[1],
@@ -258,11 +313,13 @@ export function createAppOptimizeService(config, injected) {
 // ---- helpers (exported for tests) ----
 
 // Converts a protobuf ListValue row into { column: value }, using the report's column schema.
+// `cost` becomes { amount, currency } and `day` a YYYY-MM-DD string, whatever shape the API used.
 export function toObject(row, columns) {
   const values = row.values ?? [];
   const out = {};
   columns.forEach((col, i) => (out[col.name] = decode(values[i], col)));
-  if (out.cost) out.cost = money(out.cost);
+  if (out.cost != null) out.cost = money(out.cost);
+  if (out.day != null) out.day = dayString(out.day);
   return out;
 }
 
@@ -291,6 +348,19 @@ function money(c) {
   return { amount, currency };
 }
 
+// "2026-10-01", "2026-10-01T07:00:00Z" (midnight Pacific) or a Timestamp { seconds } -> "2026-10-01".
+function dayString(v) {
+  if (typeof v === 'string') return v.slice(0, 10);
+  if (typeof v === 'object' && v.seconds != null) return dateIn(TZ, new Date(Number(v.seconds) * 1000));
+  return String(v);
+}
+
+// String literal for the report filter: backslashes and quotes escaped, control characters refused.
+export function quote(s) {
+  if (/[\p{Cc}]/u.test(s)) throw new ConfigError('service must not contain control characters');
+  return `'${s.replace(/[\\']/g, (c) => `\\${c}`)}'`;
+}
+
 function sumBy(rows, keyFn) {
   const map = new Map();
   for (const r of rows) {
@@ -303,15 +373,25 @@ function sumBy(rows, keyFn) {
 }
 
 function totals(groups) {
-  const out = {};
+  const out = new Map();
   for (const g of groups) {
     const cur = g.key.at(-1);
-    out[cur] ??= { cost: 0, groups: 0 };
-    out[cur].cost += g.amount;
-    out[cur].groups += 1;
+    const t = out.get(cur) ?? out.set(cur, { cost: 0, groups: 0 }).get(cur);
+    t.cost += g.amount;
+    t.groups += 1;
   }
-  for (const t of Object.values(out)) t.cost = round(t.cost);
-  return out;
+  for (const t of out.values()) t.cost = round(t.cost);
+  return fromMap(out);
+}
+
+function mergeNotes(list) {
+  const uniq = (key) => [...new Map(list.flatMap((n) => n[key] ?? []).map((x) => [x.projectId ?? x, x])).values()];
+  const failed = uniq('failedProjects');
+  const truncated = uniq('rowsTruncatedIn');
+  return {
+    ...(failed.length ? { failedProjects: failed } : {}),
+    ...(truncated.length ? { rowsTruncatedIn: truncated, truncatedNote: list.find((n) => n.truncatedNote)?.truncatedNote } : {}),
+  };
 }
 
 export function bucket(day, granularity) {
@@ -326,24 +406,39 @@ export function bucket(day, granularity) {
 
 // Today's date in Pacific Time, YYYY-MM-DD.
 export function pacificDate(now = new Date()) {
-  return new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(now);
+  return dateIn(TZ, now);
 }
 
-// ISO timestamp for 00:00 Pacific on the given date, with the right PST/PDT offset.
+// ISO timestamp for 00:00 Pacific on the given date, with the offset in force *at that midnight*
+// (on a DST switch day the offset changes at 02:00, so sampling noon would be an hour off).
 export function pacificMidnight(date) {
-  const utcNoon = new Date(`${date}T12:00:00Z`);
-  const tzName = new Intl.DateTimeFormat('en-US', { timeZone: TZ, timeZoneName: 'longOffset' })
-    .formatToParts(utcNoon)
-    .find((p) => p.type === 'timeZoneName').value; // e.g. "GMT-07:00"
-  return `${date}T00:00:00${tzName.replace('GMT', '')}`;
+  const wanted = Date.parse(`${date}T00:00:00Z`); // the wall-clock time we want, as a UTC number
+  let instant = wanted + 8 * 3600_000; // first guess: PST
+  for (let i = 0; i < 2; i++) instant -= wallClock(instant) - wanted;
+  const offsetMinutes = Math.round((wanted - instant) / 60_000);
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  return `${date}T00:00:00${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
-const addDays = (date, n) => {
-  const d = new Date(`${date}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + n);
-  return d.toISOString().slice(0, 10);
-};
+// Pacific wall-clock reading of an instant, expressed as a UTC timestamp of the same digits.
+function wallClock(instant) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(new Date(instant));
+  const g = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return Date.UTC(+g.year, g.month - 1, +g.day, +g.hour, +g.minute, +g.second);
+}
 
-const round = (n) => Math.round(n * 100) / 100;
+const pad = (n) => String(n).padStart(2, '0');
 
 const stripProject = (v) => (typeof v === 'string' ? v.replace(/^projects\//, '') : v);
+
+const log = (msg) => console.error(`[gcp-monitor-mcp] ${msg}`);

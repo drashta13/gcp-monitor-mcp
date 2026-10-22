@@ -179,14 +179,14 @@ The cost tools read from one of two sources. Pick one.
 |---|---|---|
 | What it is | The API behind *Monitoring → Cost Explorer* | Cloud Billing's export of every charge to BigQuery |
 | Needs | Project roles only (above) | Billing Account Administrator once, to turn it on |
-| History | Last 30 days | From when you enable it, kept forever |
+| History | About the last year | From when you enable it, kept forever |
 | Credits and discounts | Not applied (list/contract price) | Applied (`netCost`) |
 | Per-resource cost | Yes | Only with the *Detailed usage cost* export |
 | `get_cost_comparison` | Yes | Not supported yet |
 | Status | Preview (v1beta) | GA |
 | Server config | `GCP_COST_REPORT_PROJECT` | `GCP_BILLING_EXPORT_TABLE` (wins if both are set) |
 
-**App Optimize:** done if you followed steps 4 and 5 (App Optimize Admin plus the API on the home project, Viewer on each project). Each tool call creates a short-lived report in the home project, reads it and deletes it.
+**App Optimize:** done if you followed steps 4 and 5 (App Optimize Admin plus the API on the home project, Viewer on each project). Each tool call creates one short-lived report per project in scope in the home project, reads it and deletes it (leftovers from a crash are swept on the next call).
 
 **Billing export** (if you later get billing admin): Billing → **Billing export** → **BigQuery export** → enable **Detailed usage cost** into a dataset. Then grant the SA:
 
@@ -241,7 +241,7 @@ Viewer is broad: it can read the configuration of almost every service (see [Sec
 | `roles/compute.viewer` | VM health |
 | `roles/osconfig.inventoryViewer`, `roles/osconfig.vulnerabilityReportViewer` | VM OS and patch data |
 | `roles/servicehealth.viewer` | Google Cloud outages in `get_incidents` |
-| `roles/appoptimize.viewer` (home project) | reading App Optimize reports |
+| `roles/appoptimize.viewer` (home project) | reading App Optimize reports. Not needed if you keep App Optimize Admin there, which includes it |
 | a custom role with `billing.resourceCosts.get` | App Optimize cost read |
 
 Keep App Optimize Admin on the home project. The trade-off is about 10 role bindings per project instead of one.
@@ -259,6 +259,9 @@ gcloud projects get-iam-policy proj-a \
 
 # Which APIs are on?
 gcloud services list --enabled --project=proj-a
+
+# Does roles/viewer really carry the permissions the health tools need? (It should list all three.)
+gcloud iam roles describe roles/viewer --format=json | grep -E 'osconfig.inventories.list|servicehealth.events.list|monitoring.alerts.list'
 ```
 
 Then ask Claude to "list my GCP projects" (see [Claude setup](claude-setup.md)).

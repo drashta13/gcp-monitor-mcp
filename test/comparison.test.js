@@ -91,7 +91,7 @@ const COST = {
 const str = (s) => ({ stringValue: s });
 const cost = (units) => ({ listValue: { values: [str('INR'), str(String(units)), { numberValue: 0 }] } });
 
-test('get_cost_comparison runs daily and per-window resource reports and enforces the 30-day lookback', async () => {
+test('get_cost_comparison runs daily and per-window resource reports and enforces the App Optimize lookback', async () => {
   const calls = [];
   const client = {
     createReport: async (req) => {
@@ -148,9 +148,10 @@ test('get_cost_comparison runs daily and per-window resource reports and enforce
   const filters = calls.map((r) => r.filter);
   assert.ok(filters.some((f) => f.includes(`timestamp('${out.baseline.startDate}`)));
 
-  const tooLong = await mcp.callTool({ name: 'get_cost_comparison', arguments: { days: 14, baselineDays: 28 } });
-  assert.ok(tooLong.isError);
-  assert.match(tooLong.content[0].text, /last 30 days/);
+  // A baseline older than App Optimize's history (about a year) is refused, not answered with empty days.
+  const tooOld = await mcp.callTool({ name: 'get_cost_comparison', arguments: { endDate: '2025-09-01' } });
+  assert.ok(tooOld.isError);
+  assert.match(tooOld.content[0].text, /last 365 days/);
 });
 
 test('BigQuery jobs fold into one row per project', () => {
@@ -174,4 +175,20 @@ test('BigQuery jobs fold into one row per project', () => {
   assert.equal(out.resources.length, 1);
   assert.equal(out.resources[0].resource, '//bigquery.googleapis.com/projects/p/jobs/*');
   assert.equal(out.resources[0].current, 140);
+});
+
+test('flags are decided on exact per-day values, not the rounded ones shown', () => {
+  const windows = comparisonWindows('2026-10-12', 7, 21);
+  const out = compareCosts({
+    windows,
+    serviceDays: [{ service: 'Big', day: '2026-10-10', cost: 7000 }, { service: 'Big', day: '2026-10-01', cost: 21000 }],
+    currentResources: [{ resource: 'tiny', service: 'S', projectId: 'p', cost: 7 * 0.004 }],
+    baselineResources: [{ resource: 'tiny', service: 'S', projectId: 'p', cost: 21 * 60 }],
+    threshold: 25,
+    limit: 10,
+    currency: 'INR',
+  });
+  const tiny = out.resources.find((r) => r.resource === 'tiny');
+  assert.equal(tiny.currentPerDay, 0); // shown rounded...
+  assert.deepEqual(tiny.flags, ['decrease']); // ...but not reported as "stopped"
 });

@@ -220,3 +220,31 @@ test('helpers', () => {
     { 'metric.label.state': 'used', 'resource.label.zone': undefined },
   );
 });
+
+test('a metric the API rejects is reported in metricErrors instead of vanishing', async () => {
+  const rejected = Object.assign(new Error('3 INVALID_ARGUMENT: aligner not supported for this metric kind'), { code: 3 });
+  const { mcp } = await connect({
+    allowed: ['a'],
+    series: (req) => {
+      if (req.filter.includes('restart_count')) throw rejected;
+      if (req.filter.includes('core_usage_time'))
+        return [{ resource: { labels: { cluster_name: 'prod', location: 'l' } }, points: [point(1)] }];
+      return [];
+    },
+  });
+  const out = parse(await mcp.callTool({ name: 'get_resource_usage', arguments: { kind: 'gke' } }));
+  assert.deepEqual(out.metricErrors, [
+    { projectId: 'a', metric: 'containerRestarts', type: 'kubernetes.io/container/restart_count', error: rejected.message },
+  ]);
+  assert.equal(out.resources[0].name, 'prod');
+  assert.deepEqual(out.metrics.cpuCores, 'kubernetes.io/container/cpu/core_usage_time');
+});
+
+test('the echoed metrics map keeps both Cloud SQL connection metric types', async () => {
+  const { mcp } = await connect({ allowed: ['a'] });
+  const out = parse(await mcp.callTool({ name: 'get_resource_usage', arguments: { kind: 'cloudsql' } }));
+  assert.deepEqual(out.metrics.connections, [
+    'cloudsql.googleapis.com/database/postgresql/num_backends',
+    'cloudsql.googleapis.com/database/network/connections',
+  ]);
+});

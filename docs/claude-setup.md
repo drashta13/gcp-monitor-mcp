@@ -11,6 +11,7 @@ How to add the server to Claude Desktop or Claude Code, check that it's working,
 - [After a code or config change](#after-a-code-or-config-change)
 - [Example prompts](#example-prompts)
 - [Report prompts](#report-prompts)
+- [Daily history (scheduled task)](#daily-history-scheduled-task)
 
 ---
 
@@ -82,7 +83,7 @@ python3 -m json.tool "$HOME/Library/Application Support/Claude/claude_desktop_co
 
 **4. Restart Claude Desktop fully.** Quit it (⌘Q on macOS, or right-click the tray icon → Quit on Windows) and reopen it. Closing the window isn't enough.
 
-**5. Confirm it loaded.** In a new chat, open the **+ / tools** menu (Search and tools). `gcp-monitor` should be listed with 12 tools. If it isn't, or it shows an error, read the log:
+**5. Confirm it loaded.** In a new chat, open the **+ / tools** menu (Search and tools). `gcp-monitor` should be listed with 25 tools (12 with `GCP_MONITOR_HISTORY=off`). If it isn't, or it shows an error, read the log:
 
 | OS | Log |
 |---|---|
@@ -138,7 +139,7 @@ Any error message names the missing role or API. See [Troubleshooting](local-set
 
 ## Tool permissions
 
-Claude asks before using a tool the first time in a chat. Every tool here is read-only (annotated `readOnlyHint: true`), so choosing **Always allow** for `gcp-monitor` tools is reasonable. That approval doesn't cover tools from other MCP servers. Keep approving those one at a time, especially anything that writes. See [Security](security.md#7-prompt-injection-through-tool-results).
+Claude asks before using a tool the first time in a chat. Every Google Cloud tool here is read-only (annotated `readOnlyHint: true`), and the two history tools that write (`capture_snapshot`, `save_report`) only append to the local history file, so choosing **Always allow** for `gcp-monitor` tools is reasonable. A scheduled task needs it: nobody is there to click **Allow**. That approval doesn't cover tools from other MCP servers. Keep approving those one at a time, especially anything that writes. See [Security](security.md#7-prompt-injection-through-tool-results).
 
 ## Slow tools and "still running"
 
@@ -154,7 +155,7 @@ The work keeps going in the background. Claude normally retries on its own; if i
 
 | Changed | Do |
 |---|---|
-| Code (`git pull`, edits) | `npm install` if `package.json` changed, then restart Claude Desktop / `/mcp` → reconnect |
+| Code (`git pull`, edits) | `npm ci` if `package-lock.json` changed, then restart Claude Desktop / `/mcp` → reconnect |
 | `claude_desktop_config.json` | Fully restart Claude Desktop |
 | Roles or APIs in Google Cloud | Nothing locally; wait a few minutes for IAM to apply |
 | ADC login | Restart Claude so the server picks up the new credentials |
@@ -183,3 +184,31 @@ The work keeps going in the background. Claude normally retries on its own; if i
 > Write a service health report for the last 7 days. Cover incidents (get_incidents) with likely root cause from the logs (query_logs presets errors, changes, k8s_warnings, oom around each incident time), GKE cluster and workload health, Cloud SQL uptime, failover readiness, backups and PITR, and VM CPU, memory, disk, patch status, agents and snapshots. End with a prioritized list of follow-ups.
 
 Claude Desktop can also turn either report into an artifact or a document you can share.
+
+## Daily history (scheduled task)
+
+The server keeps a local history database (`~/.gcp-monitor-mcp/history.db`). A Claude scheduled task fills it once a day; any chat afterwards can look back at it.
+
+### Who decides what is saved, and when
+
+| | Decided by | How |
+|---|---|---|
+| **When** something is saved | The scheduled task's prompt | The prompt below runs once a day and says: capture first, save the report last. The server's instructions tell Claude not to call the two write tools in ordinary chats unless you ask |
+| **What the snapshot holds** | The server, not Claude | `capture_snapshot` always collects the same 14 sections for one whole day (cost by service / project / SKU / region / resource, cost comparison, incidents and uptime, Cloud SQL, GKE, GKE workloads, VMs, Cloud Run, log volume, log samples, inventory). It turns them into metrics and findings with fixed rules, so every day is comparable |
+| **What the report holds** | Claude, guided by the tool | `save_report` takes a title, a summary, the Markdown report and a list of findings (category, severity, resource, stable title, detail). The capture result ends with a `nextStep` reminding Claude to save with the `snapshotId` |
+| **When history is read** | Claude, from the server's instructions | Questions about the past ("is this new?", "since when?", "last month") go to the history tools before the live ones |
+
+### The scheduled tasks
+
+Two tasks run every day: a capture at 12:00 IST that stores everything about the last complete day, and the reports at 13:00 IST (FinOps and Service Health, saved to the history and to `reports/<day>/`). Their prompts, the reason for those times, and what they need are in [Scheduled tasks](scheduled-tasks.md).
+
+### Asking about history
+
+- "What changed since yesterday?" → `diff_snapshots`
+- "Is the vm-1 disk issue new? Since when?" → `search_findings`
+- "Show daily Compute Engine cost for the last 3 months." → `get_metric_history`
+- "Which issues have been open the longest?" → `search_findings` (sorted by open, then severity; look at `daysSeen`)
+- "Was anything unusual on the 10th?" → `find_anomalies` with `date`
+- "What did the VM errors look like last Tuesday?" → `get_history` (`snapshotId` = the day, `section` = `logs`) or `query_logs` with `endTime`
+- "Summarise last week's daily reports into a weekly report." → `list_history` + `get_history`
+- "How many high-severity findings per week since July?" → `query_history_sql`

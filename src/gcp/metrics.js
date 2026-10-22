@@ -1,5 +1,5 @@
 import { MetricServiceClient } from '@google-cloud/monitoring';
-import { perProject, mapLimit, round } from './util.js';
+import { perProject, mapLimit, round, windowEnd } from './util.js';
 
 // Curated Cloud Monitoring queries per resource kind. Each metric is aggregated server-side into one
 // series per resource (groupBy), at ~48 points over the window, and summarized here as avg / max / latest.
@@ -122,6 +122,23 @@ USAGE.uptime = {
   notes: 'availabilityPercent is the share of uptime check runs that passed, across all checker regions.',
 };
 
+// Warning-and-worse log volume per monitored resource type and severity, from the built-in log entry
+// count metric: exact counts, unlike a log listing, which stops at a page limit.
+USAGE.logs = {
+  groupBy: ['resource.type', 'metric.label.severity'],
+  key: (l) => ({ name: l['resource.type'], location: 'global', severity: l['metric.label.severity'] }),
+  sortBy: 'entries',
+  metrics: [
+    m('entries', 'logging.googleapis.com/log_entry_count', 'ALIGN_DELTA', 'REDUCE_SUM', 1, {
+      stat: 'total',
+      filter: 'metric.label.severity = one_of("WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")',
+    }),
+  ],
+  notes:
+    'One row per resource type (name) and severity: entries is the exact number of WARNING-or-worse log entries ' +
+    'written in the window. Use query_logs to read them.',
+};
+
 function m(key, type, aligner, reducer, scale = 1, extra = {}) {
   return { key, type, aligner, reducer, scale, stat: 'series', ...extra };
 }
@@ -135,12 +152,16 @@ export function createUsageService({ scope }, injected, now = () => Date.now()) 
   let client = injected;
 
   return {
-    async usage({ kind, projectIds, hours = 24, names, breakdown = 'resource', limit = 50 }) {
+    async usage({ kind, projectIds, hours = 24, endTime, names, breakdown = 'resource', limit = 50 }) {
       const spec = USAGE[kind];
       const ids = await scope(projectIds);
-      const end = Math.floor(now() / 1000);
+      const end = Math.floor(windowEnd(endTime, now) / 1000);
       const start = end - hours * 3600;
-      const alignment = Math.max(MIN_ALIGNMENT, Math.ceil((hours * 3600) / POINTS / 60) * 60);
+      // An alignment period that divides the window exactly, so a 23- or 25-hour day doesn't pick up minutes
+      // of the day before.
+      const windowSeconds = hours * 3600;
+      let alignment = Math.max(MIN_ALIGNMENT, Math.ceil(windowSeconds / POINTS / 60) * 60);
+      while (windowSeconds % alignment && alignment > MIN_ALIGNMENT) alignment -= 60;
       const byNamespace = kind === 'gke' && breakdown === 'namespace';
       const groupBy = byNamespace ? [...spec.groupBy, 'resource.label.namespace_name'] : spec.groupBy;
       const metrics = byNamespace ? spec.metrics.filter((x) => !x.node) : spec.metrics;
@@ -166,10 +187,16 @@ export function createUsageService({ scope }, injected, now = () => Date.now()) 
       }
 
       const rows = new Map();
+      // A metric the API rejected (bad aligner, quota...) is reported, not silently dropped: otherwise an
+      // issue that depends on it (e.g. container restarts) could never fire and nobody would know.
+      const metricErrors = [];
       for (const { projectId, settled } of result.ok) {
         settled.forEach((s, i) => {
-          if (s.status !== 'fulfilled') return;
           const metric = metrics[i];
+          if (s.status !== 'fulfilled') {
+            metricErrors.push({ projectId, metric: metric.key, type: metric.type, error: s.reason?.message ?? String(s.reason) });
+            return;
+          }
           for (const series of s.value) {
             const labels = seriesLabels(series, groupBy);
             const id = {
@@ -186,23 +213,35 @@ export function createUsageService({ scope }, injected, now = () => Date.now()) 
       let list = [...rows.values()];
       if (names?.length) list = list.filter((r) => names.includes(r.name));
       const sortKey = spec.sortBy;
-      // Busiest first; for availability, worst first.
+      // Busiest first; for availability, worst first. Counters sort by their total.
       const dir = spec.worstFirst ? -1 : 1;
-      list.sort((a, b) => dir * ((b.metrics[sortKey]?.avg ?? -1) - (a.metrics[sortKey]?.avg ?? -1)));
+      const sortValue = (r) => r.metrics[sortKey]?.avg ?? r.metrics[sortKey]?.total ?? -1;
+      list.sort((a, b) => dir * (sortValue(b) - sortValue(a)));
 
       return {
         kind,
         breakdown: byNamespace ? 'namespace' : 'resource',
         window: { hours, start: iso(start), end: iso(end), alignmentSeconds: alignment },
-        metrics: Object.fromEntries(metrics.map((x) => [x.key, x.type])),
+        metrics: metricTypes(metrics),
         ...(spec.notes ? { notes: spec.notes } : {}),
         returned: Math.min(list.length, limit),
         truncated: list.length > limit,
         resources: list.slice(0, limit),
+        ...(metricErrors.length ? { metricErrors } : {}),
         ...(result.failed.length ? { failedProjects: result.failed } : {}),
       };
     },
   };
+}
+
+// key -> metric type, or a list of types when several metrics feed one key (Cloud SQL connections).
+function metricTypes(metrics) {
+  const out = {};
+  for (const m of metrics) {
+    if (!(m.key in out)) out[m.key] = m.type;
+    else out[m.key] = [].concat(out[m.key], m.type);
+  }
+  return out;
 }
 
 async function query(client, { projectId, metric, start, end, alignment, groupBy }) {
@@ -234,7 +273,8 @@ export function seriesLabels(series, fields) {
   const out = {};
   for (const f of fields) {
     const [scope, , name] = f.split('.');
-    if (scope === 'resource') out[f] = series.resource?.labels?.[name];
+    if (f === 'resource.type') out[f] = series.resource?.type;
+    else if (scope === 'resource') out[f] = series.resource?.labels?.[name];
     else if (scope === 'metric') out[f] = series.metric?.labels?.[name];
     else if (scope === 'metadata') out[f] = series.metadata?.systemLabels?.fields?.[name]?.stringValue;
   }

@@ -1,7 +1,7 @@
 // Period-over-period cost comparison and anomaly detection, independent of the cost source.
 // Everything is normalized to cost per day, so a 7-day week compares fairly with a 21-day baseline.
+import { round } from './util.js';
 
-const round = (n) => (n == null ? null : Math.round(n * 100) / 100);
 const pct = (now, before) => (before > 0 ? round(((now - before) / before) * 100) : null);
 
 // Splits a window ending at `endDate` (inclusive) into the current period and the baseline before it.
@@ -50,8 +50,8 @@ export function compareCosts({
   const services = [...byService].map(([service, perDay]) => {
     const baselineSeries = dailySeries(perDay, baseline);
     const currentSeries = dailySeries(perDay, current);
-    const row = changeRow(sum0(currentSeries), sum0(baselineSeries), windows);
-    const flags = flagsFor(row, threshold, floor);
+    const { row, raw } = changeRow(sum0(currentSeries), sum0(baselineSeries), windows);
+    const flags = flagsFor(raw, threshold, floor);
 
     // A day is a spike when it sits far above the baseline's normal range (mean + 3 standard deviations)
     // and above the rest of its own week, so a steady step up reads as an increase, not seven spikes.
@@ -107,8 +107,8 @@ export function compareCosts({
   add(baselineResources, 'baseline');
 
   const resourceRows = [...resources.values()].map(({ current: c, baseline: b, ...id }) => {
-    const row = changeRow(c, b, windows);
-    const flags = flagsFor(row, threshold, floor);
+    const { row, raw } = changeRow(c, b, windows);
+    const flags = flagsFor(raw, threshold, floor);
     for (const flag of flags) anomalies.push({ type: flag, scope: 'resource', name: id.resource, ...id, ...row });
     return { ...id, ...row, ...(flags.length ? { flags } : {}) };
   });
@@ -130,27 +130,33 @@ export function compareCosts({
   };
 }
 
+// `row` is what the caller sees (rounded); `raw` is what the flags are decided on, so that a resource
+// spending 0.004/day doesn't read as "stopped" because it rounds to 0.
 function changeRow(current, baseline, { current: cw, baseline: bw }) {
   const currentPerDay = current / cw.days;
   const baselinePerDay = baseline / bw.days;
   return {
-    current: round(current),
-    currentPerDay: round(currentPerDay),
-    baselinePerDay: round(baselinePerDay),
-    deltaPerDay: round(currentPerDay - baselinePerDay),
-    changePct: pct(currentPerDay, baselinePerDay),
+    raw: { currentPerDay, baselinePerDay },
+    row: {
+      current: round(current),
+      currentPerDay: round(currentPerDay),
+      baselinePerDay: round(baselinePerDay),
+      deltaPerDay: round(currentPerDay - baselinePerDay),
+      changePct: pct(currentPerDay, baselinePerDay),
+    },
   };
 }
 
 // new: no baseline spend. stopped: spend went to zero. increase / decrease: past the threshold.
 // All need the daily change to clear the noise floor.
-function flagsFor(row, threshold, floor) {
-  const delta = Math.abs(row.currentPerDay - row.baselinePerDay);
+function flagsFor({ currentPerDay, baselinePerDay }, threshold, floor) {
+  const delta = Math.abs(currentPerDay - baselinePerDay);
   if (delta < floor) return [];
-  if (row.baselinePerDay === 0) return ['new'];
-  if (row.currentPerDay === 0) return ['stopped'];
-  if (row.changePct >= threshold) return ['increase'];
-  if (row.changePct <= -threshold) return ['decrease'];
+  if (baselinePerDay === 0) return ['new'];
+  if (currentPerDay === 0) return ['stopped'];
+  const changePct = ((currentPerDay - baselinePerDay) / baselinePerDay) * 100;
+  if (changePct >= threshold) return ['increase'];
+  if (changePct <= -threshold) return ['decrease'];
   return [];
 }
 

@@ -34,7 +34,7 @@ Claude calls the server's tools, gets compact JSON back, and writes the answer.
 └────────────┬─────────────┘
              │ MCP over stdio (JSON-RPC)
 ┌────────────▼─────────────┐
-│ gcp-monitor-mcp (Node)   │  src/server.js: 12 tools, input validation (zod),
+│ gcp-monitor-mcp (Node)   │  src/server.js: 25 tools, input validation (zod),
 │                          │  background jobs + 10-min cache, error → hint
 └────────────┬─────────────┘
              │ Application Default Credentials
@@ -78,7 +78,7 @@ Some Google Cloud calls are slow. An App Optimize cost report takes 15 to 60+ se
 | stdio transport | Runs locally under the user's own login; no server to host or secure |
 | ADC + impersonation, no keys | Nothing secret on disk or in config; access is revocable centrally and audited |
 | One service account for all projects | One identity to grant and revoke; roles per project |
-| App Optimize as default cost source | The owner has no billing-admin access; it needs only project roles. Trade-off: list prices, 30 days |
+| App Optimize as default cost source | The owner has no billing-admin access; it needs only project roles. Trade-off: list prices, about a year of history |
 | One App Optimize report per project | The API accepts only one scope per report; the server fans out and merges |
 | REST via `google-auth-library` for SQL, GKE, Compute, OS Config, Logging, Service Health | Avoids six heavy client libraries; responses are plain JSON |
 | Client libraries for Asset Inventory, Monitoring, App Optimize, BigQuery | Pagination and streaming are worth it there |
@@ -90,7 +90,7 @@ Some Google Cloud calls are slow. An App Optimize cost report takes 15 to 60+ se
 
 | Data | Source | Freshness | Limits |
 |---|---|---|---|
-| Costs (default) | App Optimize API (v1beta, preview) | lags up to 1 day | last 30 days; list prices before credits/CUDs; Pacific days |
+| Costs (default) | App Optimize API (v1beta, preview) | lags up to 1 day | about the last year; list prices before credits/CUDs; Pacific days |
 | Costs (optional) | Cloud Billing export in BigQuery | lags hours to 1 day | exact; history from when enabled |
 | Inventory | Cloud Asset Inventory | minutes | |
 | Metrics | Cloud Monitoring | ~1-3 min | VM memory/disk need the Ops Agent |
@@ -107,7 +107,8 @@ gcp-monitor-mcp/
 │   ├── server.js           tool definitions (schemas, descriptions), backgroundJob, error hints
 │   ├── config.js           environment variables and validation
 │   └── gcp/
-│       ├── util.js         project scope/allowlist, perProject fan-out, concurrency limit
+│       ├── errors.js       ConfigError: a problem the caller can fix, shown to the model as-is
+│       ├── util.js         project ID check + allowlist, perProject fan-out, concurrency limit, Map helpers
 │       ├── rest.js         authenticated REST client (google-auth-library) with paging
 │       ├── projects.js     list_projects
 │       ├── inventory.js    list_resources (Cloud Asset Inventory)
@@ -127,19 +128,22 @@ gcp-monitor-mcp/
 ## Development
 
 ```bash
-npm install
+npm ci
 npm test            # offline: fake Google clients, MCP over InMemoryTransport
 npm run inspect     # MCP Inspector against your real projects
+npm run coverage    # test coverage report
 ```
+
+Code style is Prettier (`.prettierrc`: 120 columns, single quotes). CI (`.github/workflows/test.yml`) runs the tests on Node 22 and 24 (`node:sqlite` needs 22.13+).
 
 - **Never write to stdout** (`console.log`). It is the MCP channel, and stray output corrupts the protocol. Log with `console.error`.
 - New tools follow the same pattern: a service module in `src/gcp/` that takes `{ scope, rest | client, usage }`, uses `perProject()` for fan-out, and a `server.registerTool()` with a zod schema, `READ_ONLY` annotations and the `handler()` wrapper. Wrap slow ones with `job()`.
 - Inject fakes in tests. No test touches Google Cloud.
-- Keep tools read-only. A tool that writes needs its own identity and a separate review (see [Security](security.md)).
+- Keep tools read-only towards Google Cloud. A tool that writes to Google Cloud needs its own identity and a separate review (see [Security](security.md)). The history tools in `src/history/` write only to the local SQLite file.
 
 ## Status and roadmap
 
-**v0.5.1:** 12 tools covering cost, inventory, usage and service health, all verified against live projects.
+**v0.7.0:** 12 Google Cloud tools covering cost, inventory, usage and service health, plus 9 local history tools: day-aligned snapshots of everything, anomaly detection, and scheduled daily FinOps and Service Health reports. See [CHANGELOG.md](../CHANGELOG.md).
 
 - [ ] Budgets and Recommender (idle resources, rightsizing suggestions)
 - [ ] `get_cost_comparison` for the BigQuery export source

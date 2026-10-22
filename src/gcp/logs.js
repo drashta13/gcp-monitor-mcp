@@ -1,4 +1,4 @@
-import { perProject, projectNotes } from './util.js';
+import { perProject, projectNotes, tally, fromMap, windowEnd } from './util.js';
 
 const LOGGING = 'https://logging.googleapis.com/v2/entries:list';
 
@@ -25,15 +25,19 @@ const MESSAGE_CHARS = 500;
 // other private logs need roles/logging.privateLogViewer and are not covered.
 export function createLogsService({ scope, rest, now = Date.now }) {
   return {
-    async query({ projectIds, preset, filter, hours = 24, limit = 50, resourceName }) {
+    async query({ projectIds, preset, filter, hours = 24, endTime, limit = 50, resourceName }) {
       const ids = await scope(projectIds);
-      const since = new Date(now() - hours * 3600_000).toISOString();
+      const end = windowEnd(endTime, now);
+      const since = new Date(end - hours * 3600_000).toISOString();
+      const until = endTime ? new Date(end).toISOString() : null;
       const parts = [
         `timestamp>="${since}"`,
+        until ? `timestamp<"${until}"` : null,
         preset ? PRESETS[preset] : null,
         filter ? `(${filter})` : null,
         // Plain name match anywhere in the resource labels, e.g. a cluster, instance or service name.
-        resourceName ? `"${resourceName.replaceAll('"', '')}"` : null,
+        // Quotes and backslashes are dropped so the name can't close the string.
+        resourceName ? `"${resourceName.replace(/["\\]/g, '')}"` : null,
       ].filter(Boolean);
       const fullFilter = parts.join(' AND ');
 
@@ -52,16 +56,16 @@ export function createLogsService({ scope, rest, now = Date.now }) {
         return { projectId, items, truncated };
       });
 
-      const entries = result.ok
+      const all = result.ok
         .flatMap(({ projectId, items }) => items.map((e) => toEntry(e, projectId)))
-        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
-        .slice(0, limit);
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+      const entries = all.slice(0, limit);
 
       return {
         filter: fullFilter,
-        window: { hours, since },
+        window: { hours, since, ...(until ? { until } : {}) },
         returned: entries.length,
-        truncated: result.ok.some((r) => r.truncated) || entries.length >= limit,
+        truncated: result.ok.some((r) => r.truncated) || all.length > limit,
         bySeverity: countBy(entries, (e) => e.severity),
         byResource: countBy(entries, (e) => `${e.resource.type}:${e.resource.name ?? ''}`),
         entries,
@@ -86,24 +90,38 @@ function toEntry(e, projectId) {
     timestamp: e.timestamp,
     severity: e.severity ?? 'DEFAULT',
     projectId,
-    log: decodeURIComponent((e.logName ?? '').split('/logs/').pop()),
+    log: logName(e.logName),
     resource: { type: e.resource?.type, name },
-    message: message(e)?.slice(0, MESSAGE_CHARS) ?? null,
+    message: text(message(e))?.slice(0, MESSAGE_CHARS) ?? null,
     ...(e.protoPayload ? { audit: audit(e.protoPayload) } : {}),
-    ...(e.jsonPayload?.reason ? { reason: e.jsonPayload.reason } : {}),
+    ...(e.jsonPayload?.reason ? { reason: text(e.jsonPayload.reason) } : {}),
   };
+}
+
+// "projects/p/logs/cloudaudit.googleapis.com%2Factivity" -> "cloudaudit.googleapis.com/activity".
+// A log name with a broken % sequence is shown as-is rather than failing the whole query.
+function logName(full) {
+  const short = (full ?? '').split('/logs/').pop();
+  try {
+    return decodeURIComponent(short);
+  } catch {
+    return short;
+  }
 }
 
 function message(e) {
   if (e.textPayload) return e.textPayload;
   const j = e.jsonPayload;
   if (j) {
-    if (j.reason && j.message) return `${j.reason}: ${j.message}`;
+    if (j.reason && j.message) return `${text(j.reason)}: ${text(j.message)}`;
     return j.message ?? j.MESSAGE ?? j.msg ?? j.error ?? JSON.stringify(j);
   }
   if (e.protoPayload) return e.protoPayload.status?.message ?? e.protoPayload.methodName;
   return null;
 }
+
+// Structured logs often put an object where a string is expected.
+const text = (v) => (v == null ? null : typeof v === 'string' ? v : JSON.stringify(v));
 
 function audit(p) {
   return {
@@ -114,8 +132,9 @@ function audit(p) {
   };
 }
 
+// Keys are log text (severity, resource names): count in a Map, not an object.
 function countBy(list, fn) {
-  const out = {};
-  for (const x of list) out[fn(x)] = (out[fn(x)] ?? 0) + 1;
-  return out;
+  const out = new Map();
+  for (const x of list) tally(out, fn(x));
+  return fromMap(out);
 }

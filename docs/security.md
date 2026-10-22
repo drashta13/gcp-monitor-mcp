@@ -16,6 +16,7 @@ What can go wrong with this server and how to avoid it. The short version: **rea
 | 10 | [Exposing the server on a network](#10-keep-it-on-stdio) | stdio only |
 | 11 | [Unvetted changes to the server](#11-review-changes-and-dependencies) | Review code and dependencies; pin versions |
 | 12 | [No audit trail](#12-audit-and-revoke) | Audit logs; know how to revoke fast |
+| 13 | [The local history database](#13-the-local-history-database) | Private file, read-only SQL, stored text is data |
 
 ---
 
@@ -77,7 +78,7 @@ Mitigations:
 
 Log lines, resource names, labels and alert names are text that **other people or systems can write**. An attacker who can get text into your logs (a crafted URL, user agent or form field) can try to plant instructions such as "ignore previous instructions and ...". Claude reads that text as data in a tool result.
 
-This server can't be made to *do* anything harmful: it has no write tools, and its identity can't change anything. The risk is other tools in the same chat:
+This server can't be made to *do* anything harmful: it has no tools that write to Google Cloud, and the only things its identity can create are App Optimize cost reports (deleted after reading) and byte-capped BigQuery query jobs. Its only writes are appends to the local history file (see [13](#13-the-local-history-database)). The risk is other tools in the same chat:
 
 - Don't give blanket **Always allow** to tools from *other* MCP servers that write (email, Slack, GitHub, shell, file system) in chats where you read logs.
 - Read what Claude proposes to do after reading logs, before approving a write.
@@ -95,7 +96,7 @@ This server can't be made to *do* anything harmful: it has no write tools, and i
 
 - `claude_desktop_config.json` lives outside the repo; keep it that way.
 - The env vars here are not secrets (project IDs), so `.mcp.json` with `--scope project` is acceptable, but it publishes your project IDs to everyone with repo access.
-- Never put credentials in env vars in these configs. If you ever add a secret, use `.env` (already in `.gitignore`) or a secret manager.
+- Never put credentials in env vars in these configs. If you ever add a secret, use a secret manager; the server does not load a `.env` file (`.env*` is in `.gitignore` only as a safety net).
 - Run `git status` before committing to make sure no `*.json` key or `.env` slipped in.
 
 ### 10. Keep it on stdio
@@ -108,7 +109,7 @@ The MCP Inspector (`npm run inspect`) runs a local proxy with a session token. U
 
 The server runs with your credentials, so its code is part of your security boundary.
 
-- Review diffs before running new versions, especially changes to `src/gcp/rest.js`, auth, or anything that adds a non-GET call. Today the only non-read calls are App Optimize report create/delete and the Logging `entries:list` POST (a read).
+- Review diffs before running new versions, especially changes to `src/gcp/rest.js`, auth, or anything that adds a non-GET call. Today the only non-read calls are App Optimize report create/delete, BigQuery query jobs on the billing export (billed, capped by `GCP_BQ_MAX_BYTES_BILLED`) and the Logging `entries:list` POST (a read).
 - Commit `package-lock.json` and install with `npm ci` for reproducible installs. Run `npm audit` periodically.
 - Only use official `@google-cloud/*`, `google-auth-library` and `@modelcontextprotocol/sdk` packages.
 
@@ -125,3 +126,12 @@ protoPayload.authenticationInfo.principalEmail="mcp-reader@<home-project>.iam.gs
 1. One person: remove their Token Creator on `mcp-reader`.
 2. One project: remove the SA's roles there and take it out of the allowlist.
 3. Everyone: **disable** the `mcp-reader` service account (IAM & Admin → Service Accounts → Disable). This is reversible and stops every server immediately.
+
+### 13. The local history database
+
+`~/.gcp-monitor-mcp/history.db` (or `GCP_MONITOR_DB_PATH`) keeps what the daily snapshots and reports contain: resource, instance and cluster names and labels, alert policy names, Google Cloud event text, cost per service / project / SKU / resource, health findings, the reports Claude wrote, and **samples of log entries**: up to 200 per `query_logs` preset per day, including message text (first 500 characters) and, for the `changes` preset, the audit-log principal (who made the change). Everything in [6](#6-know-what-data-leaves-google-cloud) about log contents applies to the file too, and it keeps them for `GCP_MONITOR_HISTORY_DAYS` (default 400), longer than Cloud Logging's usual 30 days. If your logs can hold personal data or secrets, shorten the retention, or capture without the `logs` section (`sections` input, or `--sections` on the CLI).
+
+- The folder is created 0700 and the file 0600, so other users on the machine can't read it. SQLite's `-wal` / `-shm` side files sit in the same private folder. The daily reports written to `reports/` in the repo are ignored by git; don't commit or share them casually. Keep full-disk encryption on, and don't sync the folder to cloud drives or commit it.
+- `query_history_sql` runs on a separate **read-only** connection and refuses anything but one `SELECT`; extensions can't be loaded. The two write tools only insert rows; nothing in the server deletes history except the retention prune (`GCP_MONITOR_HISTORY_DAYS`).
+- **Stored text is still untrusted.** A name planted in a label or alert today comes back from `get_history` or `search_findings` months later, and earlier reports are Claude's own words built from untrusted data. The server instructions tell Claude to treat history as data; the advice in [7](#7-prompt-injection-through-tool-results) applies to scheduled runs too. Keep the scheduled task's chat free of other servers' write tools.
+- To wipe the history, quit Claude and delete the folder. To stop recording, set `GCP_MONITOR_HISTORY=off`.

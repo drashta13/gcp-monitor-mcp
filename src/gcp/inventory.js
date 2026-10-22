@@ -1,5 +1,5 @@
 import { AssetServiceClient } from '@google-cloud/asset';
-import { perProject } from './util.js';
+import { perProject, fromMap } from './util.js';
 
 // Friendly resource kinds mapped to Cloud Asset Inventory types. `usage` names the get_resource_usage kind
 // that has metrics for it.
@@ -49,12 +49,16 @@ export function createInventoryService({ scope }, injected) {
 
   async function search(projectId, assetTypes) {
     const out = [];
+    let truncated = false;
     const iterable = client.searchAllResourcesAsync({ scope: `projects/${projectId}`, assetTypes, pageSize: 500 });
     for await (const r of iterable) {
+      if (out.length >= MAX_PER_PROJECT) {
+        truncated = true;
+        break;
+      }
       out.push(toResource(r, projectId));
-      if (out.length >= MAX_PER_PROJECT) break;
     }
-    return out;
+    return { projectId, resources: out, truncated };
   }
 
   return {
@@ -71,29 +75,43 @@ export function createInventoryService({ scope }, injected) {
         throw err;
       }
 
-      const all = result.ok.flat();
+      const all = dedupeFunctions(result.ok.flatMap((r) => r.resources));
+      const truncatedProjects = result.ok.filter((r) => r.truncated).map((r) => r.projectId);
       const shown = includeInactive ? all : all.filter((r) => r.active);
       shown.sort(
         (a, b) =>
           a.kind.localeCompare(b.kind) || a.projectId.localeCompare(b.projectId) || a.name.localeCompare(b.name),
       );
 
-      const counts = {};
+      const counts = new Map();
       for (const r of all) {
-        counts[r.kind] ??= { active: 0, inactive: 0 };
-        counts[r.kind][r.active ? 'active' : 'inactive'] += 1;
+        const c = counts.get(r.kind) ?? counts.set(r.kind, { active: 0, inactive: 0 }).get(r.kind);
+        c[r.active ? 'active' : 'inactive'] += 1;
       }
 
       return {
         projects: ids,
-        counts,
+        counts: fromMap(counts),
         returned: Math.min(shown.length, limit),
         truncated: shown.length > limit,
+        ...(truncatedProjects.length
+          ? { truncatedProjects, truncatedNote: `Only the first ${MAX_PER_PROJECT} resources per project were read.` }
+          : {}),
         resources: shown.slice(0, limit).map(({ active, ...r }) => (includeInactive ? { ...r, active } : r)),
         ...(result.failed.length ? { failedProjects: result.failed } : {}),
       };
     },
   };
+}
+
+// A 2nd-gen Cloud Function is also a Cloud Run service with the same name and location. Keep the function
+// row and drop the Cloud Run duplicate so it isn't counted twice.
+function dedupeFunctions(resources) {
+  const fnKeys = new Set(
+    resources.filter((r) => r.kind === 'functions').map((r) => `${r.projectId}/${r.location}/${r.name}`),
+  );
+  if (!fnKeys.size) return resources;
+  return resources.filter((r) => r.kind !== 'cloudrun' || !fnKeys.has(`${r.projectId}/${r.location}/${r.name}`));
 }
 
 function toResource(r, projectId) {

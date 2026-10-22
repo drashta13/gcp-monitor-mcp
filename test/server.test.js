@@ -200,3 +200,49 @@ test('slow cost calls return "running", keep working, and the retry gets the cac
   await assert.rejects(failing({}), /boom/);
   assert.equal(calls, 3); // failures are retried, not cached
 });
+
+// ---- added with the 2026-10-14 review fixes ----
+
+test('inputs: impossible dates, malformed project IDs and oversized project lists are refused before any query', async () => {
+  const { client, bq } = await connect();
+  const bad = await client.callTool({ name: 'get_cost_summary', arguments: { startDate: '2026-02-31' } });
+  assert.ok(bad.isError);
+  assert.match(bad.content[0].text, /calendar date/);
+  const path = await client.callTool({ name: 'get_cost_summary', arguments: { projectIds: ['../../x?y=1#'] } });
+  assert.ok(path.isError);
+  const many = await client.callTool({ name: 'get_cost_summary', arguments: { projectIds: Array.from({ length: 51 }, (_, i) => `p-${i}`) } });
+  assert.ok(many.isError);
+  assert.equal(bq.calls.length, 0);
+  // Duplicates collapse to one bound parameter.
+  await client.callTool({ name: 'get_cost_trend', arguments: { projectIds: ['dup-1', 'dup-1'] } });
+  assert.deepEqual(bq.calls[0].params.projectIds, ['dup-1']);
+});
+
+test('health tools on a server without health services fail with a clear message', async () => {
+  const { client } = await connect();
+  const res = await client.callTool({ name: 'get_vm_health', arguments: {} });
+  assert.ok(res.isError);
+  assert.match(res.content[0].text, /vm health service is not configured/);
+});
+
+test('a slow health tool says what it is doing, not "cost report"', async () => {
+  const config = loadConfig({ GCP_BILLING_EXPORT_TABLE: TABLE });
+  const server = createServer({
+    projects: { list: async () => [] },
+    billing: createBillingService(config, fakeBigQuery()),
+    health: { logs: { query: () => new Promise(() => {}) } },
+    waitMs: 10,
+  });
+  const [c, s] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: 't', version: '0' });
+  await Promise.all([server.connect(s), client.connect(c)]);
+  const out = parse(await client.callTool({ name: 'query_logs', arguments: {} }));
+  assert.equal(out.status, 'running');
+  assert.match(out.message, /still searching logs/);
+});
+
+test('withDates takes "today" in the cost source time zone', () => {
+  const now = new Date('2026-10-11T02:00:00Z'); // 19:00 Pacific on the 10th
+  assert.equal(withDates({}, now, 'America/Los_Angeles').endDate, '2026-10-10');
+  assert.equal(withDates({}, now).endDate, '2026-10-11');
+});

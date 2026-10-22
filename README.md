@@ -2,11 +2,11 @@
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that lets Claude and other MCP clients monitor Google Cloud: what you spend, what's running, and how it's behaving, across all your projects, from a conversation.
 
-> **Status: v0.5.1.** Cost (with week-over-baseline anomalies), inventory, usage metrics and service health (Cloud SQL, GKE, VMs, incidents, logs).
+> **Status: v0.7.0.** Cost (with week-over-baseline anomalies), inventory, usage metrics, service health (Cloud SQL, GKE, VMs, incidents, logs), and a local history database that a scheduled task fills with everything about each day, with anomaly detection and daily FinOps and Service Health reports.
 
 ## Tools
 
-The server is **read-only**. Every tool is annotated `readOnlyHint`.
+The server is **read-only towards Google Cloud**. Every Google Cloud tool is annotated `readOnlyHint`. The only two tools that write, `capture_snapshot` and `save_report`, write to a local SQLite file on your machine.
 
 | Tool | Status | What it does |
 |------|--------|--------------|
@@ -16,14 +16,24 @@ The server is **read-only**. Every tool is annotated `readOnlyHint`.
 | `get_cost_comparison` | ✅ | This week vs the 3 weeks before, per day, by service and resource, with anomalies flagged (spikes, big increases, new and stopped spend). Built for a weekly FinOps report |
 | `get_top_cost_resources` | ✅ | The individual resources that cost the most |
 | `list_resources` | ✅ | Active resources across projects (VMs, GKE, Cloud SQL, Cloud Run, functions, Redis, buckets...) via Cloud Asset Inventory |
-| `get_resource_usage` | ✅ | CPU, memory, pods, connections, requests... per resource from Cloud Monitoring, as avg / max / latest |
+| `get_resource_usage` | ✅ | CPU, memory, pods, connections, requests... per resource from Cloud Monitoring, as avg / max / latest; also exact warning/error log volume (`kind: logs`) |
 | `get_cloudsql_health` | ✅ | HA/failover, backups and PITR, backup runs, maintenance, plus uptime, CPU, memory, disk, connections, IOPS |
 | `get_gke_health` | ✅ | Versions and skew, release channel, node pools and autoscaling, OOM / crash-loop / scheduling events, autoscaler decisions, restarts |
 | `get_vm_health` | ✅ | OS and patch status (vulnerabilities), OS Config and Ops Agent health, snapshot coverage, CPU / memory / disk, unattached disks |
 | `get_incidents` | ✅ | Alerting-policy incidents with duration, Google Cloud outages affecting you (Service Health), uptime-check availability |
 | `query_logs` | ✅ | Cloud Logging search with presets (errors, k8s_warnings, oom, crashloop, changes, cloudsql, autoscaler) for root-cause evidence |
+| `capture_snapshot` | ✅ | Everything about one day into the local history: cost by service / project / SKU / region / resource, cost anomalies, incidents and uptime, Cloud SQL / GKE / VM / Cloud Run health, GKE workloads, log volume and samples, inventory. Stored as raw results, metrics and findings, with anomalies vs the previous 14 days |
+| `save_report` | ✅ | Save a written report and its conclusions to the history |
+| `list_history`, `get_history` | ✅ | Browse saved reports and snapshots, including the raw tool results of any past day |
+| `search_findings` | ✅ | Issue history: first seen, last seen, how many days, still open |
+| `find_anomalies` | ✅ | Anything unusual on a day vs the days before: cost, utilization, errors, restarts, uptime |
+| `add_event`, `list_events`, `delete_event` | ✅ | Sales calendar: planned scale-ups are expected, not anomalies |
+| `review_event` | ✅ | A sale's cost vs normal and vs the previous sale, and anything not scaled back down after it |
+| `get_metric_history` | ✅ | Daily cost and utilization series, as far back as the history goes |
+| `diff_snapshots` | ✅ | What changed between two days: new, resolved and persisting issues, metrics that moved |
+| `query_history_sql` | ✅ | Read-only SQL over the history for anything else |
 
-Cost tools accept `startDate` / `endDate` (UTC, default month to date), `projectIds` and `service` filters.
+Health, usage, incident and log tools accept `endTime` to look at a past window. Cost tools accept `startDate` / `endDate` (default month to date; days are UTC on the BigQuery export source and Pacific Time on the App Optimize source), `projectIds` and `service` filters.
 
 ## How it works
 
@@ -43,9 +53,10 @@ gcp-monitor-mcp (node) ── Application Default Credentials ──► mcp-read
         └─► BigQuery              Cloud Billing export (all projects on the billing account)
 ```
 
-- **Costs come from one of two sources.** The App Optimize API (what Cost Explorer uses) needs no billing access but shows list prices for the last 30 days. The Cloud Billing export to BigQuery is exact (credits and discounts applied) and keeps history. Both lag usage by up to a day.
+- **Costs come from one of two sources.** The App Optimize API (what Cost Explorer uses) needs no billing access but shows list prices, reaching back about a year. The Cloud Billing export to BigQuery is exact (credits and discounts applied) and keeps history. Both lag usage by up to a day.
 - **Queries are parameterized** and the group-by/granularity options are whitelisted, so tool input never becomes SQL text. Each query filters on `_PARTITIONTIME` and is capped by `maximumBytesBilled`.
 - **Errors come back as tool errors with a fix**, e.g. missing credentials suggests the `gcloud` command and permission errors name the role.
+- **History is a local SQLite file** (`~/.gcp-monitor-mcp/history.db`, Node's built-in `node:sqlite`, no extra dependency), one snapshot per day. A Claude scheduled task captures each day, another writes the FinOps and Service Health reports from it, and any later chat can ask what changed, since when, and whether it's unusual. See [Scheduled tasks](docs/scheduled-tasks.md). `npm run capture` captures or backfills days from the terminal.
 
 ## Documentation
 
@@ -56,6 +67,7 @@ Full docs are in [`docs/`](docs/README.md):
 - [Local setup](docs/local-setup.md): install, log in, configure, run, troubleshoot
 - [Connect it to Claude](docs/claude-setup.md): Claude Desktop and Claude Code, example prompts
 - [Tools reference](docs/tools.md): every tool's inputs, outputs and how it works
+- [Scheduled tasks](docs/scheduled-tasks.md): the daily capture and report tasks and their prompts
 - [Security](docs/security.md): pitfalls to avoid
 
 ## Quick start
@@ -68,7 +80,8 @@ gcloud iam service-accounts add-iam-policy-binding mcp-reader@my-main-project.ia
 # ...grant Viewer in each project, plus App Optimize Admin in my-main-project
 
 # 2. Local
-npm install && npm test
+git clone https://github.com/drashta13/gcp-monitor-mcp.git && cd gcp-monitor-mcp
+npm ci && npm test
 gcloud auth application-default login \
   --impersonate-service-account=mcp-reader@my-main-project.iam.gserviceaccount.com
 ```
@@ -99,6 +112,9 @@ gcloud auth application-default login \
 | `GCP_BILLING_EXPORT_TABLE` | BigQuery billing export table, used instead of App Optimize when set |
 | `GCP_BILLING_QUERY_PROJECT` | Project that runs BigQuery jobs (default: the table's project) |
 | `GCP_BQ_MAX_BYTES_BILLED` | Per-query BigQuery scan cap (default 5 GiB) |
+| `GCP_MONITOR_DB_PATH` | History database file (default `~/.gcp-monitor-mcp/history.db`) |
+| `GCP_MONITOR_HISTORY_DAYS` | Days of history to keep (default 400) |
+| `GCP_MONITOR_HISTORY` | `off` removes the history tools |
 
 ## Development
 
@@ -114,6 +130,8 @@ gcloud auth application-default login \
 - [x] Resource inventory (Cloud Asset Inventory)
 - [x] Usage metrics (Cloud Monitoring): VMs, GKE, Cloud SQL, Cloud Run
 - [x] Service health: Cloud SQL, GKE, VMs, incidents, logs, uptime
+- [x] Local history: daily snapshots, saved reports, finding recurrence, metric trends
+- [x] Day-aligned capture of all data, anomaly detection on history, backfill CLI, scheduled FinOps and health reports
 - [ ] Budgets and Recommender (idle resources, rightsizing)
 - [ ] Package as a Claude Desktop extension (`.mcpb`)
 
